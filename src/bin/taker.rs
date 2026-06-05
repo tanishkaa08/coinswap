@@ -323,8 +323,9 @@ fn main() -> Result<(), TakerError> {
     // Build unified taker config (also used by the Restore branch).
     let backend = match args.electrum_url.as_ref() {
         Some(url) => coinswap::wallet::BackendConfig::Electrum(coinswap::wallet::ElectrumConfig {
-            url: url.clone(),
+            url: url.to_string(),
             wallet_name,
+            privacy: coinswap::wallet::PrivacyConfig::default(),
         }),
         None => coinswap::wallet::BackendConfig::Bitcoind(rpc_config),
     };

@@ -72,6 +72,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let electrum_cfg = ElectrumConfig {
         url: electrum_url,
         wallet_name: "electrum-taker-example".to_string(),
+        privacy: coinswap::wallet::PrivacyConfig::default(),
     };
 
     println!("About to initialize taker...");

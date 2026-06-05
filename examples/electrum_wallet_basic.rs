@@ -68,6 +68,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let electrum_cfg = ElectrumConfig {
         url: electrum_url,
         wallet_name: "electrum-wallet-example".to_string(),
+        privacy: coinswap::wallet::PrivacyConfig::default(),
     };
 
     std::fs::create_dir_all(wallet_path.parent().unwrap())?;

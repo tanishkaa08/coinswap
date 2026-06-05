@@ -30,7 +30,11 @@ use bitcoin::{
 use electrum_client::{Client as ElectrumClient, ElectrumApi};
 use serde::Deserialize;
 
-use super::{error::WalletError, Wallet};
+use super::{
+    decoy::{build_private_query_batches_from_pool, PrivacyConfig},
+    error::WalletError,
+    Wallet,
+};
 
 /// Bitcoin Core JSON-RPC backend
 pub type BitcoindBackend = bitcoind::bitcoincore_rpc::Client;
@@ -55,6 +59,25 @@ pub trait BlockchainBackend: RpcApi + Debug + Send + Sync + 'static {
     /// Register a scriptPubKey for UTXO lookups. No-op on Bitcoin Core; Electrum
     /// stores it locally along with an optional HD-origin hint.
     fn watch_script(&self, _script: &Script, _hd: Option<HdOrigin>) {}
+
+    /// Register a decoy script for Electrum privacy queries.
+    ///
+    /// Bitcoin Core ignores this. Electrum stores these separately from real
+    /// wallet scripts so query results from decoys can be ignored.
+    fn watch_decoy_script(&self, _script: &Script) {}
+
+    /// Clear currently registered decoy scripts.
+    ///
+    /// Used before each Electrum sync so retired decoys do not keep getting
+    /// queried forever.
+    fn clear_decoy_scripts(&self) {}
+
+    /// Optional Electrum privacy config.
+    ///
+    /// Bitcoin Core returns None. Electrum returns its configured privacy policy.
+    fn privacy_config(&self) -> Option<PrivacyConfig> {
+        None
+    }
 
     /// HD-origin recorded for `script_pubkey` (Electrum only). Bitcoin Core
     /// exposes the same info via the descriptor string on each UTXO, so the
@@ -107,6 +130,22 @@ impl BlockchainBackend for ElectrumBackend {
             }
         }
     }
+    fn watch_decoy_script(&self, script: &Script) {
+        if let Ok(mut decoys) = self.decoys.lock() {
+            decoys.insert(script.to_owned());
+        }
+    }
+
+    fn clear_decoy_scripts(&self) {
+        if let Ok(mut decoys) = self.decoys.lock() {
+            decoys.clear();
+        }
+    }
+
+    fn privacy_config(&self) -> Option<PrivacyConfig> {
+        Some(self.privacy.clone())
+    }
+
     fn hd_origin_for_script(&self, script: &Script) -> Option<HdOrigin> {
         self.hd_paths.lock().ok()?.get(script).cloned()
     }
@@ -157,6 +196,11 @@ pub struct ElectrumBackend {
     pub(crate) inner: ElectrumClient,
     /// Scripts the wallet has asked us to track via [`BlockchainBackend::watch_script`].
     pub(crate) watched: Mutex<HashSet<ScriptBuf>>,
+
+    /// Decoy scripts queried only as privacy cover.
+    ///
+    /// Results from these scripts must never be added to wallet state.
+    pub(crate) decoys: Mutex<HashSet<ScriptBuf>>,
     /// HD-origin hint per watched script (when known), so UTXOs on those
     /// scripts can be classified as `SeedCoin` without a descriptor round-trip.
     pub(crate) hd_paths: Mutex<HashMap<ScriptBuf, HdOrigin>>,
@@ -168,6 +212,8 @@ pub struct ElectrumBackend {
     pub(crate) hash_to_height: Mutex<HashMap<BlockHash, u64>>,
     /// Network derived from the server's reported genesis hash.
     pub(crate) network: bitcoin::Network,
+    /// Privacy settings used for Electrum address-pool query obfuscation.
+    pub(crate) privacy: PrivacyConfig,
 }
 
 impl Debug for ElectrumBackend {
@@ -187,6 +233,8 @@ pub struct ElectrumConfig {
     /// On-disk wallet file name. Read via [`BackendConfig::wallet_name`] when
     /// the maker/taker init derives the wallet path.
     pub wallet_name: String,
+    /// Privacy settings for Electrum address-pool query obfuscation.
+    pub privacy: PrivacyConfig,
 }
 
 impl Default for ElectrumConfig {
@@ -194,6 +242,7 @@ impl Default for ElectrumConfig {
         Self {
             url: "electrum1.bluewallet.io:50001".to_string(),
             wallet_name: "coinswap-wallet".to_string(),
+            privacy: PrivacyConfig::default(),
         }
     }
 }
@@ -242,6 +291,8 @@ impl ElectrumBackend {
         Ok(Self {
             inner,
             watched: Mutex::new(HashSet::new()),
+            decoys: Mutex::new(HashSet::new()),
+            privacy: cfg.privacy.clone(),
             hd_paths: Mutex::new(HashMap::new()),
             locked: Mutex::new(HashSet::new()),
             height_to_hash: Mutex::new(HashMap::new()),
@@ -644,18 +695,32 @@ impl RpcApi for ElectrumBackend {
         let tip = self.get_block_count()?;
         let min_conf = minconf.unwrap_or(0) as u32;
 
-        // Batch the per-script queries via JSON-RPC batching so N watched scripts
-        // become ~N/BATCH round-trips instead of N. Some servers cap individual
-        // batch payload size, so we chunk rather than send everything in one shot.
-        const LIST_UNSPENT_BATCH: usize = 200;
+        let decoys: Vec<ScriptBuf> = self
+            .decoys
+            .lock()
+            .map_err(poisoned)?
+            .iter()
+            .cloned()
+            .collect();
+
+        let query_batches = build_private_query_batches_from_pool(&watched, &decoys, &self.privacy);
+
         let mut out = Vec::new();
-        for chunk in watched.chunks(LIST_UNSPENT_BATCH) {
-            let refs: Vec<&Script> = chunk.iter().map(|s| s.as_script()).collect();
+
+        for batch in query_batches {
+            let refs: Vec<&Script> = batch.iter().map(|item| item.script.as_script()).collect();
+
             let results = self
                 .inner
                 .batch_script_list_unspent(refs.iter().copied())
                 .map_err(electrum_err)?;
-            for (script, entries) in chunk.iter().zip(results) {
+
+            for (item, entries) in batch.iter().zip(results) {
+                if !item.is_real {
+                    continue;
+                }
+
+                let script = &item.script;
                 for e in entries {
                     let outpoint = OutPoint {
                         txid: e.tx_hash,
@@ -883,6 +948,7 @@ impl<B: BlockchainBackend> Wallet<B> {
     /// then list UTXOs via per-scripthash queries.
     fn sync_no_rescan(&mut self) -> Result<(), WalletError> {
         self.populate_backend_watched_scripts()?;
+        self.populate_backend_decoy_scripts()?;
         let tip = self.rpc.get_block_count()?;
         self.finalize_sync(tip)
     }

@@ -2,7 +2,7 @@
 //!
 //! Currently, wallet synchronization is exclusively performed through RPC for makers.
 //! In the future, takers might adopt alternative synchronization methods, such as lightweight wallet solutions.
-
+use secp256k1::rand::Rng;
 use std::{cmp::max, fmt::Display, path::PathBuf, str::FromStr, thread, time::Duration};
 
 use std::collections::HashMap;
@@ -38,6 +38,7 @@ use rust_coinselect::{
 };
 
 use super::{
+    decoy::DecoyEntry,
     error::WalletError,
     rpc::{BitcoindBackend, BlockchainBackend, HdOrigin},
     storage::{AddressType, WalletStore},
@@ -1136,6 +1137,112 @@ impl<B: BlockchainBackend> Wallet<B> {
         Ok(())
     }
 
+    /// Generate/register decoy scripts for Electrum privacy queries.
+    ///
+    /// The real wallet scripts are registered by `populate_backend_watched_scripts`.
+    /// This function registers extra wallet-derived scripts that are queried only
+    /// as privacy cover. Results from these decoy scripts are ignored by
+    /// ElectrumBackend::list_unspent.
+    pub(crate) fn populate_backend_decoy_scripts(&mut self) -> Result<(), WalletError> {
+        if !B::IS_ELECTRUM {
+            return Ok(());
+        }
+
+        self.rpc.clear_decoy_scripts();
+
+        let Some(privacy) = self.rpc.privacy_config() else {
+            return Ok(());
+        };
+
+        if !privacy.enabled {
+            return Ok(());
+        }
+
+        // Keep persisted cache parameters in sync with the active config.
+        self.store.decoy_cache.max_cache_size = privacy.max_decoy_cache_size;
+        self.store.decoy_cache.rotation_range = privacy.decoy_rotation_range;
+        self.store.decoy_cache.max_age_secs = privacy.max_decoy_age_secs;
+        self.store.decoy_cache.retire_after_uses_range = privacy.retire_after_uses_range;
+
+        let secp = crate::utill::global_secp();
+
+        let p2wpkh_account = self.store.master_key.derive_priv(
+            secp,
+            &DerivationPath::from_str(Self::get_derivation_path(AddressType::P2WPKH))?,
+        )?;
+
+        let p2tr_account = self.store.master_key.derive_priv(
+            secp,
+            &DerivationPath::from_str(Self::get_derivation_path(AddressType::P2TR))?,
+        )?;
+
+        // Avoid colliding with the real watched range 0..get_addrss_import_count().
+        let real_gap_limit = self.get_addrss_import_count();
+
+        let highest_cached_index = self
+            .store
+            .decoy_cache
+            .entries
+            .iter()
+            .map(|entry| entry.hd_index)
+            .max()
+            .unwrap_or(real_gap_limit);
+
+        let mut next_decoy_index = highest_cached_index.max(real_gap_limit) + 1;
+
+        // For this first version, keep a reusable decoy pool in the backend.
+        // list_unspent will randomly sample from this pool for every query batch.
+        let decoy_pool_target = privacy
+            .max_decoy_cache_size
+            .min(privacy.decoy_pool_range.1.max(1));
+
+        let mut derive_fresh_decoy = || {
+            let mut rng = secp256k1::rand::thread_rng();
+
+            let address_type = if rng.gen_bool(0.5) {
+                AddressType::P2WPKH
+            } else {
+                AddressType::P2TR
+            };
+
+            let keychain = if rng.gen_bool(0.5) {
+                KeychainKind::External
+            } else {
+                KeychainKind::Internal
+            };
+
+            let account = match address_type {
+                AddressType::P2WPKH => &p2wpkh_account,
+                AddressType::P2TR => &p2tr_account,
+            };
+
+            let script =
+                Self::script_from_account(secp, account, address_type, keychain, next_decoy_index)?;
+
+            let entry = DecoyEntry::new(
+                script,
+                next_decoy_index,
+                address_type,
+                matches!(keychain, KeychainKind::Internal),
+                privacy.retire_after_uses_range.1,
+            );
+
+            next_decoy_index = next_decoy_index.saturating_add(1);
+
+            Ok(entry)
+        };
+
+        let decoys = self
+            .store
+            .decoy_cache
+            .select_decoys_for_batch(decoy_pool_target, &mut derive_fresh_decoy)?;
+
+        for script in decoys {
+            self.rpc.watch_decoy_script(&script);
+        }
+
+        Ok(())
+    }
     /// Wallet descriptors are derivable. Currently only supports two KeychainKind. Internal and External.
     fn get_wallet_descriptors(
         &self,

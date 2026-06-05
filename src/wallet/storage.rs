@@ -7,7 +7,7 @@ use crate::{
     wallet::UTXOSpendInfo,
 };
 
-use super::{error::WalletError, fidelity::FidelityBond};
+use super::{decoy::DecoyCache, error::WalletError, fidelity::FidelityBond};
 
 use bitcoin::{bip32::Xpriv, Network, OutPoint, ScriptBuf};
 use serde::{Deserialize, Serialize};
@@ -65,6 +65,12 @@ pub(crate) struct WalletStore {
     /// Maps transaction outpoints to their associated UTXO and spend information.
     #[serde(default)] // Ensures deserialization works if `utxo_cache` is missing
     pub(super) utxo_cache: HashMap<OutPoint, (ListUnspentResultEntry, UTXOSpendInfo)>,
+
+    /// Persistent decoy cache for Electrum privacy queries.
+    ///
+    /// Stored with the wallet so decoy reuse/rotation survives across syncs.
+    #[serde(default)]
+    pub(crate) decoy_cache: DecoyCache,
 }
 
 impl WalletStore {
@@ -75,6 +81,7 @@ impl WalletStore {
         network: Network,
         master_key: Xpriv,
         wallet_birthday: Option<u64>,
+
         store_enc_material: &Option<KeyMaterial>,
     ) -> Result<Self, WalletError> {
         let store = Self {
@@ -92,6 +99,7 @@ impl WalletStore {
             last_synced_height: None,
             wallet_birthday,
             utxo_cache: HashMap::new(),
+            decoy_cache: DecoyCache::default(),
         };
 
         std::fs::create_dir_all(path.parent().expect("Path should NOT be root!"))?;

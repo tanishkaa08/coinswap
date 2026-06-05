@@ -3,7 +3,9 @@ use clap::Parser;
 use coinswap::{
     maker::{bind_port_retry, start_server, MakerError, MakerServer, MakerServerConfig},
     utill::{parse_proxy_auth, setup_maker_logger},
-    wallet::{BackendConfig, BitcoindBackend, ElectrumBackend, ElectrumConfig, RPCConfig},
+    wallet::{
+        BackendConfig, BitcoindBackend, ElectrumBackend, ElectrumConfig, PrivacyConfig, RPCConfig,
+    },
 };
 use std::{path::PathBuf, sync::Arc};
 
@@ -111,7 +113,11 @@ fn main() -> Result<(), MakerError> {
 
     // Set backend from CLI flags: --electrum-url takes precedence; otherwise Bitcoin Core.
     config.backend = match args.electrum_url {
-        Some(url) => BackendConfig::Electrum(ElectrumConfig { url, wallet_name }),
+        Some(url) => BackendConfig::Electrum(ElectrumConfig {
+            url,
+            wallet_name,
+            privacy: PrivacyConfig::default(),
+        }),
         None => BackendConfig::Bitcoind(RPCConfig {
             url: args.rpc,
             auth: Auth::UserPass(args.auth.0, args.auth.1),

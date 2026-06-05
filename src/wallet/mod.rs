@@ -1,6 +1,7 @@
 //! The Coinswap Wallet (unsecured). Used by both the Taker and Maker.
-
 mod api;
+mod decoy;
+
 mod backup;
 mod error;
 pub mod ffi;
@@ -15,6 +16,7 @@ pub(crate) mod swapcoin;
 
 pub use api::{Balances, RecoveryOutcome, UTXOSpendInfo, Wallet};
 pub use backup::WalletBackup;
+pub use decoy::{DecoyCache, DecoyEntry, PrivacyConfig, PrivateQueryItem};
 pub use error::WalletError;
 pub use fidelity::FidelityBond;
 pub(crate) use fidelity::{
